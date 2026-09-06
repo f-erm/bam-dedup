@@ -166,19 +166,20 @@ def _event_positions(sig):
 
 def group_disagreement_positions(sigs):
     """Positions where the records in a group don't all agree"""
-    per_pos = {}                      # pos -> (set of events, count of records)
+    events_at = {}                     
+    records_at = Counter()
+
     for s1, s2 in sigs:
-        seen = set()
-        for e in s1 | s2:
-            pos = _event_positions(e)
-            events, count = per_pos.get(pos, (set(), 0))
-            events.add(e)
-            per_pos[pos] = (events, count + (pos not in seen))
-            seen.add(pos)
+        merged = s1 | s2
+        for pos in _event_positions(merged):
+            records_at[pos] += 1
+        for e in merged:
+            pos = e[1] if isinstance(e[0], str) else e[0]
+            events_at.setdefault(pos, set()).add(e)
 
     n = len(sigs)
-    return sum(1 for events, count in per_pos.values()
-               if len(events) > 1 or count < n)
+    return sum(1 for pos, events in events_at.items()
+               if len(events) > 1 or records_at[pos] < n)
 
 
 def log_group_stats(logfile, chunk, kind):
@@ -189,8 +190,8 @@ def log_group_stats(logfile, chunk, kind):
         f"{len(chunk)}\t"
         f"{len(counts)}\t"
         f"{max(counts.values())}\t"
-        f"{count_distinct_molecules(chunk)}\n"
-        f"{group_disagreement_positions(sigs)}"
+        f"{count_distinct_molecules(chunk)}\t"
+        f"{group_disagreement_positions(sigs)}\n"
     )
 
 # ----------------------------------------------------------------------------
