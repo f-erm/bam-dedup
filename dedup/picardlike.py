@@ -583,15 +583,18 @@ def _comparable(lhs, rhs, compare_read2):
     return True
 
 
-def generate_duplicate_indexes(frag_list, pair_list, index_optical, optical_dist):
+def generate_duplicate_indexes(frag_list, pair_list, index_optical, optical_dist, rmlog):
     duplicate_indexes = set()
     optical_indexes = set()
     optical_cluster_count = 0
+
+    logfile = open("w",rmlog)
 
     # ---- pairs ----
     pair_list.sort(key=ReadEnds.sort_key)
     for chunk in _chunks(pair_list, compare_read2=True):
         if len(chunk) > 1:
+            logfile.write(str(len(chunk))+"\n")
             optical_cluster_count += _mark_pairs(
                 chunk, duplicate_indexes, optical_indexes,
                 index_optical, optical_dist)
@@ -609,14 +612,17 @@ def generate_duplicate_indexes(frag_list, pair_list, index_optical, optical_dist
             contains_frags = contains_frags or (not nxt.is_paired)
         else:
             if len(current) > 1 and contains_frags:
+                logfile.write(str(len(chunk))+"\n")
                 _mark_fragments(current, contains_pairs, duplicate_indexes)
             current = [nxt]
             first = nxt
             contains_pairs = nxt.is_paired
             contains_frags = not nxt.is_paired
     if len(current) > 1 and contains_frags:
+        logfile.write(str(len(chunk))+"\n")
         _mark_fragments(current, contains_pairs, duplicate_indexes)
 
+    logfile.close()
     return duplicate_indexes, optical_indexes, optical_cluster_count
 
 
@@ -713,7 +719,8 @@ def mark_duplicates(input_bam, output_bam,
                     read_name_regex_enabled=True,
                     optical_pixel_distance=DEFAULT_OPTICAL_PIXEL_DISTANCE,
                     metrics_file=None,
-                    barcode_tag=None):
+                    barcode_tag=None,
+                    rmlog=None):
     """
     barcode_tag: when set, reads/pairs are additionally grouped by the value of
     this tag before duplicate detection, so records that would otherwise look
@@ -737,7 +744,7 @@ def mark_duplicates(input_bam, output_bam,
 
     index_optical = remove_sequencing_duplicates or (metrics_file is not None)
     dup_idx, opt_idx, opt_clusters = generate_duplicate_indexes(
-        frag_list, pair_list, index_optical, optical_pixel_distance)
+        frag_list, pair_list, index_optical, optical_pixel_distance, rmlog)
 
     n_dup = write_output(input_bam, output_bam, dup_idx, opt_idx,
                          remove_duplicates, remove_sequencing_duplicates)
