@@ -53,6 +53,7 @@ htsjdk DuplicateScoringStrategy / OpticalDuplicateFinder.
 import argparse
 import math
 import sys
+from collections import Counter
 
 import pysam
 
@@ -64,6 +65,110 @@ try:
 except ImportError:  # pragma: no cover - pure-Python fallback
     _fast = None
     _HAVE_FAST = False
+
+# ----------------------------------------------------------------------------
+# Read diversity constants -- Evaluate diversity in each duplicate group
+# ----------------------------------------------------------------------------
+
+#TODO: Note sure how this handles soft clipping for now.
+
+_CIG_INS, _CIG_DEL, _CIG_REFSKIP = 1, 2, 3
+_EMPTY_SIG = frozenset()
+DEFAULT_MIN_BQ = 30 #TODO: this is just some guess, might need different value
+
+def _indel_events(read):
+    """Indels as (op, ref_pos, length). Walks the cigar tracking reference position."""
+    events = []
+    ref = read.reference_start
+    for op, length in read.cigartuples:
+        if op in (0, 7, 8):                      # M, =, X
+            ref += length
+        elif op == _CIG_DEL:
+            events.append(("D", ref, length))
+            ref += length
+        elif op == _CIG_REFSKIP:
+            ref += length
+        elif op == _CIG_INS:
+            events.append(("I", ref, length))
+        # S, H, P consume no reference
+    return events
+
+
+def _hq_substitutions(read, min_bq):
+    """(ref_pos, observed_base) for mismatches whose base quality clears min_bq.
+
+    Requires the MD tag. get_aligned_pairs(with_seq=True) returns the reference
+    base, lower-cased exactly at mismatching positions.
+    """
+    quals = read.query_qualities
+    seq = read.query_sequence
+    if quals is None or seq is None:
+        return []
+    out = []
+    for qpos, refpos, refbase in read.get_aligned_pairs(matches_only=True,
+                                                        with_seq=True):
+        if refbase is None or refbase.isupper():
+            continue                              # upper case == match
+        if quals[qpos] >= min_bq:
+            out.append((refpos, seq[qpos]))
+    return out
+
+
+def mismatch_signature(read, min_bq=DEFAULT_MIN_BQ):
+    """Compact description of how this read departs from the reference."""
+    if read.cigartuples is None:
+        return _EMPTY_SIG
+    indels = _indel_events(read)
+    if not indels:
+        try:
+            if read.get_tag("NM") == 0:           # fast path: no edits at all
+                return _EMPTY_SIG
+        except KeyError:
+            pass
+    subs = _hq_substitutions(read, min_bq)
+    if not subs and not indels:
+        return _EMPTY_SIG
+    return frozenset(subs).union(indels)
+
+
+def count_distinct_molecules(chunk, max_diff=1, max_group=500):
+    """Estimated number of distinct source molecules in a duplicate group."""
+    n = len(chunk)
+    if n < 2:
+        return n
+    if n > max_group:
+        return None                       # pileup artifact; O(n^2) not worth it
+
+    parent = list(range(n))
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    sigs = [(e.sig1, e.sig2) for e in chunk]
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = len(sigs[i][0] ^ sigs[j][0]) + len(sigs[i][1] ^ sigs[j][1])
+            if d <= max_diff:
+                ra, rb = find(i), find(j)
+                if ra != rb:
+                    parent[ra] = rb
+
+    return len({find(i) for i in range(n)})
+
+
+def log_group_stats(logfile, chunk, kind):
+    sigs = [(e.sig1, e.sig2) for e in chunk]
+    counts = Counter(sigs)
+    logfile.write(
+        f"kind:{kind}\t"
+        f"n_groupsize:{len(chunk)}\t"
+        f"n_distinct_exact:{len(counts)}\t"
+        f"n_distinct_exact_max:{max(counts.values())}\t"
+        f"n_distinct_clustered:{count_distinct_molecules(chunk)}"
+    )
 
 # ----------------------------------------------------------------------------
 # Orientation constants -- mirror picard ReadEnds.java exactly.
@@ -101,6 +206,7 @@ class ReadEnds:
         "tile", "x", "y",
         "is_optical_duplicate",
         "barcode_value",
+        "sig1", "sig2",
     )
 
     def __init__(self):
@@ -121,6 +227,8 @@ class ReadEnds:
         self.is_optical_duplicate = False
         # "" when barcode_tag is not in use, so grouping is unaffected by default.
         self.barcode_value = ""
+        self.sig1 = _EMPTY_SIG
+        self.sig2 = _EMPTY_SIG
 
     @property
     def is_paired(self):
@@ -148,6 +256,8 @@ class ReadEnds:
         c.y = self.y
         c.is_optical_duplicate = self.is_optical_duplicate
         c.barcode_value = self.barcode_value
+        c.sig1 = self.sig1
+        c.sig2 = self.sig2
         return c
 
     # Sort key == picard ReadEndsMDComparator.compare, extended with an
@@ -463,6 +573,7 @@ def build_read_ends(bam, read_name_regex_enabled, optical_dist, barcode_tag=None
         e.orientation = R if read.is_reverse else F
         e.read1_index = index
         e.score = compute_duplicate_score(read)
+        e.sig1 = mismatch_signature(read, DEFAULT_MIN_BQ)
         if read.is_paired and not read.mate_is_unmapped:
             e.read2_ref = read.next_reference_id
         e.library_id, _ = library_id_for(read)
@@ -547,6 +658,7 @@ def _combine_mate(paired, frag, read, optical):
         paired.read2_ref = mates_ref
         paired.read2_coord = mates_coord
         paired.read2_index = frag.read1_index
+        paired.sig2 = frag.sig1
         paired.orientation = orientation_byte(paired.orientation == R,
                                               read.is_reverse)
         # Undefined RF at identical position -> force FR (see Picard comment).
@@ -558,9 +670,11 @@ def _combine_mate(paired, frag, read, optical):
         paired.read2_ref = paired.read1_ref
         paired.read2_coord = paired.read1_coord
         paired.read2_index = paired.read1_index
+        paired.sig2 = paired.sig1
         paired.read1_ref = mates_ref
         paired.read1_coord = mates_coord
         paired.read1_index = frag.read1_index
+        paired.sig1 = frag.sig1
         paired.orientation = orientation_byte(read.is_reverse,
                                               paired.orientation == R)
 
@@ -583,18 +697,19 @@ def _comparable(lhs, rhs, compare_read2):
     return True
 
 
-def generate_duplicate_indexes(frag_list, pair_list, index_optical, optical_dist, rmlog):
+def generate_duplicate_indexes(frag_list, pair_list, index_optical, optical_dist, rmlog=None):
     duplicate_indexes = set()
     optical_indexes = set()
     optical_cluster_count = 0
 
-    logfile = open("w",rmlog)
+    logfile = open(rmlog, "w") if rmlog else None
 
     # ---- pairs ----
     pair_list.sort(key=ReadEnds.sort_key)
     for chunk in _chunks(pair_list, compare_read2=True):
         if len(chunk) > 1:
-            logfile.write(str(len(chunk))+"\n")
+            if logfile is not None:
+                log_group_stats(logfile, chunk, "pair")
             optical_cluster_count += _mark_pairs(
                 chunk, duplicate_indexes, optical_indexes,
                 index_optical, optical_dist)
@@ -612,17 +727,25 @@ def generate_duplicate_indexes(frag_list, pair_list, index_optical, optical_dist
             contains_frags = contains_frags or (not nxt.is_paired)
         else:
             if len(current) > 1 and contains_frags:
-                logfile.write(str(len(current))+"\n")
+                if logfile is not None:
+                    frags_only = [e for e in current if not e.is_paired]
+                    if len(frags_only) > 1:
+                        log_group_stats(logfile, frags_only, "frag")
                 _mark_fragments(current, contains_pairs, duplicate_indexes)
             current = [nxt]
             first = nxt
             contains_pairs = nxt.is_paired
             contains_frags = not nxt.is_paired
     if len(current) > 1 and contains_frags:
-        logfile.write(str(len(current))+"\n")
+        if logfile is not None:
+            frags_only = [e for e in current if not e.is_paired]
+            if len(frags_only) > 1:
+                log_group_stats(logfile, frags_only, "frag")
         _mark_fragments(current, contains_pairs, duplicate_indexes)
 
-    logfile.close()
+    if logfile is not None:
+        logfile.close()
+
     return duplicate_indexes, optical_indexes, optical_cluster_count
 
 
@@ -780,6 +903,8 @@ def main(argv=None):
                    help="group duplicate candidates by this tag's value in addition to "
                         "position/orientation (e.g. a cell barcode tag); reads sharing a "
                         "position but carrying different tag values are never collapsed")
+    p.add_argument("--rmlog", default=None,
+               help="write per-duplicate-group diversity stats to rmdupslog file")
     args = p.parse_args(argv)
 
     mark_duplicates(
@@ -790,6 +915,7 @@ def main(argv=None):
         optical_pixel_distance=args.optical_pixel_distance,
         metrics_file=args.metrics_file,
         barcode_tag=args.barcode_tag,
+        rmlog=args.rmlog,
     )
 
 
