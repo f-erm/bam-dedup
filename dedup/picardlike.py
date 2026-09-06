@@ -159,6 +159,28 @@ def count_distinct_molecules(chunk, max_diff=1, max_group=500):
     return len({find(i) for i in range(n)})
 
 
+def _event_positions(sig):
+    """Reference positions touched by a signature."""
+    return {e[1] if e[0] in ("I", "D") else e[0] for e in sig}
+
+
+def group_disagreement_positions(sigs):
+    """Positions where the records in a group don't all agree"""
+    per_pos = {}                      # pos -> (set of events, count of records)
+    for s1, s2 in sigs:
+        seen = set()
+        for e in s1 | s2:
+            pos = _event_positions(e)
+            events, count = per_pos.get(pos, (set(), 0))
+            events.add(e)
+            per_pos[pos] = (events, count + (pos not in seen))
+            seen.add(pos)
+
+    n = len(sigs)
+    return sum(1 for events, count in per_pos.values()
+               if len(events) > 1 or count < n)
+
+
 def log_group_stats(logfile, chunk, kind):
     sigs = [(e.sig1, e.sig2) for e in chunk]
     counts = Counter(sigs)
@@ -168,6 +190,7 @@ def log_group_stats(logfile, chunk, kind):
         f"{len(counts)}\t"
         f"{max(counts.values())}\t"
         f"{count_distinct_molecules(chunk)}\n"
+        f"{group_disagreement_positions(sigs)}"
     )
 
 # ----------------------------------------------------------------------------
@@ -704,7 +727,7 @@ def generate_duplicate_indexes(frag_list, pair_list, index_optical, optical_dist
 
     if rmlog:
         logfile = open(rmlog, "w")
-        logfile.write(f"kind\tn_groupsize\tn_distinct_exact\tn_distinct_exact_max\tn_distinct_clustered\n")
+        logfile.write(f"kind\tn_groupsize\tn_distinct_exact\tn_distinct_exact_max\tn_distinct_clustered\tn_group_disagreement_positions\n")
     else:
         logfile = None
 
