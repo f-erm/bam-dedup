@@ -163,11 +163,11 @@ def log_group_stats(logfile, chunk, kind):
     sigs = [(e.sig1, e.sig2) for e in chunk]
     counts = Counter(sigs)
     logfile.write(
-        f"kind:{kind}\t"
-        f"n_groupsize:{len(chunk)}\t"
-        f"n_distinct_exact:{len(counts)}\t"
-        f"n_distinct_exact_max:{max(counts.values())}\t"
-        f"n_distinct_clustered:{count_distinct_molecules(chunk)}"
+        f"{kind}\t"
+        f"{len(chunk)}\t"
+        f"{len(counts)}\t"
+        f"{max(counts.values())}\t"
+        f"{count_distinct_molecules(chunk)}\n"
     )
 
 # ----------------------------------------------------------------------------
@@ -702,7 +702,11 @@ def generate_duplicate_indexes(frag_list, pair_list, index_optical, optical_dist
     optical_indexes = set()
     optical_cluster_count = 0
 
-    logfile = open(rmlog, "w") if rmlog else None
+    if rmlog:
+        logfile = open(rmlog, "w")
+        logfile.write(f"kind\tn_groupsize\tn_distinct_exact\tn_distinct_exact_max\tn_distinct_clustered\n")
+    else:
+        logfile = None
 
     # ---- pairs ----
     pair_list.sort(key=ReadEnds.sort_key)
