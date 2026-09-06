@@ -612,14 +612,14 @@ def generate_duplicate_indexes(frag_list, pair_list, index_optical, optical_dist
             contains_frags = contains_frags or (not nxt.is_paired)
         else:
             if len(current) > 1 and contains_frags:
-                logfile.write(str(len(chunk))+"\n")
+                logfile.write(str(len(current))+"\n")
                 _mark_fragments(current, contains_pairs, duplicate_indexes)
             current = [nxt]
             first = nxt
             contains_pairs = nxt.is_paired
             contains_frags = not nxt.is_paired
     if len(current) > 1 and contains_frags:
-        logfile.write(str(len(chunk))+"\n")
+        logfile.write(str(len(current))+"\n")
         _mark_fragments(current, contains_pairs, duplicate_indexes)
 
     logfile.close()
