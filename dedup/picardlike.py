@@ -74,7 +74,9 @@ except ImportError:  # pragma: no cover - pure-Python fallback
 
 _CIG_INS, _CIG_DEL, _CIG_REFSKIP = 1, 2, 3
 _EMPTY_SIG = frozenset()
+_EMPTY_SUBQ = {}
 DEFAULT_MIN_BQ = 30 #TODO: this is just some guess, might need different value
+DEFAULT_QUAL_GAP = 10 #TODO: this is just some guess, might need different value
 
 def _indel_events(read):
     """Indels as (op, ref_pos, length). Walks the cigar tracking reference position."""
@@ -94,45 +96,75 @@ def _indel_events(read):
     return events
 
 
-def _hq_substitutions(read, min_bq):
-    """(ref_pos, observed_base) for mismatches whose base quality clears min_bq.
-
-    Requires the MD tag. get_aligned_pairs(with_seq=True) returns the reference
-    base, lower-cased exactly at mismatching positions.
+def _all_substitutions(read):
+    """ref_pos -> (observed_base, base_qual) for every mismatch, independent of quality. Requires the MD tag. 
     """
     quals = read.query_qualities
     seq = read.query_sequence
     if quals is None or seq is None:
-        return []
-    out = []
+        return _EMPTY_SUBQ
+    out = {}
     for qpos, refpos, refbase in read.get_aligned_pairs(matches_only=True,
                                                         with_seq=True):
         if refbase is None or refbase.isupper():
             continue                              # upper case == match
-        if quals[qpos] >= min_bq:
-            out.append((refpos, seq[qpos]))
+        out[refpos] = (seq[qpos], quals[qpos])
     return out
 
 
 def mismatch_signature(read, min_bq=DEFAULT_MIN_BQ):
-    """Compact description of how this read departs from the reference."""
+    """Compact description of how this read departs from the reference and observed quality for each observed substitution.
+
+    Returns (sig, sub_quals). sig is frozenset of >=min_bq events. sub_quals is dict mapping ref_pos -> (observed_base, base_qual) for every substitution regardless of quality".
+    """
     if read.cigartuples is None:
-        return _EMPTY_SIG
+        return _EMPTY_SIG, _EMPTY_SUBQ
     indels = _indel_events(read)
     if not indels:
         try:
             if read.get_tag("NM") == 0:           # fast path: no edits at all
-                return _EMPTY_SIG
+                return _EMPTY_SIG, _EMPTY_SUBQ
         except KeyError:
             pass
-    subs = _hq_substitutions(read, min_bq)
-    if not subs and not indels:
-        return _EMPTY_SIG
-    return frozenset(subs).union(indels)
+    all_subs = _all_substitutions(read)
+    if not all_subs and not indels:
+        return _EMPTY_SIG, _EMPTY_SUBQ
+    hq_subs = [(pos, base) for pos, (base, qual) in all_subs.items() if qual >= min_bq]
+    sig = frozenset(hq_subs).union(indels) if (hq_subs or indels) else _EMPTY_SIG
+    return sig, all_subs
 
 
-def count_distinct_molecules(chunk, max_diff=1, max_group=500):
-    """Estimated number of distinct source molecules in a duplicate group."""
+#TODO: simply returns lower distance for reads with vastly different quality. Is this Preferred?
+def _weighted_diff(sig_a, sig_b, subq_a, subq_b, qual_gap):
+    """Symmetric difference between two signatures, discounting disagreements that are better explained by unreliable base quality.
+
+    A differing event at a given ref_pos is NOT counted when:
+      - both reads called the same substitution there (one just fell under
+        min_bq and so is missing from sig, not from subq), or
+      - both reads called a substitution but quality gap is >= qual_gap . lower-quality call is discounted
+    """
+    d = 0
+    scored_positions = set()
+    for ev in sig_a ^ sig_b:
+        pos = ev[0]
+        if not isinstance(pos, int):          # indel event ("I"/"D", ref, len)
+            d += 1
+            continue
+        if pos in scored_positions:
+            continue                          # already scored (both sides had a confident, differing call)
+        scored_positions.add(pos)
+        in_a, in_b = subq_a.get(pos), subq_b.get(pos)
+        if in_a is not None and in_b is not None:
+            base_a, qual_a = in_a
+            base_b, qual_b = in_b
+            if base_a == base_b or abs(qual_a - qual_b) >= qual_gap:
+                continue
+        d += 1
+    return d
+
+
+def count_distinct_molecules(chunk, max_diff=1, max_group=500, qual_gap=DEFAULT_QUAL_GAP):
+    """Estimated number of distinct source molecules in a duplicate group. Clusters reads in a chunk by their missmatch signature."""
     n = len(chunk)
     if n < 2:
         return n
@@ -148,9 +180,11 @@ def count_distinct_molecules(chunk, max_diff=1, max_group=500):
         return a
 
     sigs = [(e.sig1, e.sig2) for e in chunk]
+    subqs = [(e.sub_quals1, e.sub_quals2) for e in chunk]
     for i in range(n):
         for j in range(i + 1, n):
-            d = len(sigs[i][0] ^ sigs[j][0]) + len(sigs[i][1] ^ sigs[j][1])
+            d = (_weighted_diff(sigs[i][0], sigs[j][0], subqs[i][0], subqs[j][0], qual_gap)
+                 + _weighted_diff(sigs[i][1], sigs[j][1], subqs[i][1], subqs[j][1], qual_gap))
             if d <= max_diff:
                 ra, rb = find(i), find(j)
                 if ra != rb:
@@ -158,6 +192,7 @@ def count_distinct_molecules(chunk, max_diff=1, max_group=500):
 
     return len({find(i) for i in range(n)})
 
+# -------------------------------------------------------------- #
 
 def _event_positions(sig):
     """Reference positions touched by a signature."""
@@ -230,6 +265,7 @@ class ReadEnds:
         "is_optical_duplicate",
         "barcode_value",
         "sig1", "sig2",
+        "sub_quals1", "sub_quals2",
     )
 
     def __init__(self):
@@ -252,6 +288,8 @@ class ReadEnds:
         self.barcode_value = ""
         self.sig1 = _EMPTY_SIG
         self.sig2 = _EMPTY_SIG
+        self.sub_quals1 = _EMPTY_SUBQ
+        self.sub_quals2 = _EMPTY_SUBQ
 
     @property
     def is_paired(self):
@@ -281,6 +319,8 @@ class ReadEnds:
         c.barcode_value = self.barcode_value
         c.sig1 = self.sig1
         c.sig2 = self.sig2
+        c.sub_quals1 = self.sub_quals1
+        c.sub_quals2 = self.sub_quals2
         return c
 
     # Sort key == picard ReadEndsMDComparator.compare, extended with an
@@ -596,7 +636,7 @@ def build_read_ends(bam, read_name_regex_enabled, optical_dist, barcode_tag=None
         e.orientation = R if read.is_reverse else F
         e.read1_index = index
         e.score = compute_duplicate_score(read)
-        e.sig1 = mismatch_signature(read, DEFAULT_MIN_BQ)
+        e.sig1, e.sub_quals1 = mismatch_signature(read, DEFAULT_MIN_BQ)
         if read.is_paired and not read.mate_is_unmapped:
             e.read2_ref = read.next_reference_id
         e.library_id, _ = library_id_for(read)
@@ -682,6 +722,7 @@ def _combine_mate(paired, frag, read, optical):
         paired.read2_coord = mates_coord
         paired.read2_index = frag.read1_index
         paired.sig2 = frag.sig1
+        paired.sub_quals2 = frag.sub_quals1
         paired.orientation = orientation_byte(paired.orientation == R,
                                               read.is_reverse)
         # Undefined RF at identical position -> force FR (see Picard comment).
@@ -694,10 +735,12 @@ def _combine_mate(paired, frag, read, optical):
         paired.read2_coord = paired.read1_coord
         paired.read2_index = paired.read1_index
         paired.sig2 = paired.sig1
+        paired.sub_quals2 = paired.sub_quals1
         paired.read1_ref = mates_ref
         paired.read1_coord = mates_coord
         paired.read1_index = frag.read1_index
         paired.sig1 = frag.sig1
+        paired.sub_quals1 = frag.sub_quals1
         paired.orientation = orientation_byte(read.is_reverse,
                                               paired.orientation == R)
 
@@ -725,18 +768,22 @@ def generate_duplicate_indexes(frag_list, pair_list, index_optical, optical_dist
     optical_indexes = set()
     optical_cluster_count = 0
 
+    ### --- logging diversity ---
     if rmlog:
         logfile = open(rmlog, "w")
         logfile.write(f"kind\tn_groupsize\tn_distinct_exact\tn_distinct_exact_max\tn_distinct_clustered\tn_group_disagreement_positions\n")
     else:
         logfile = None
+    ### -------------------------
 
     # ---- pairs ----
     pair_list.sort(key=ReadEnds.sort_key)
     for chunk in _chunks(pair_list, compare_read2=True):
         if len(chunk) > 1:
+            ### --- logging diversity ---
             if logfile is not None:
                 log_group_stats(logfile, chunk, "pair")
+            ### -------------------------
             optical_cluster_count += _mark_pairs(
                 chunk, duplicate_indexes, optical_indexes,
                 index_optical, optical_dist)
@@ -754,20 +801,24 @@ def generate_duplicate_indexes(frag_list, pair_list, index_optical, optical_dist
             contains_frags = contains_frags or (not nxt.is_paired)
         else:
             if len(current) > 1 and contains_frags:
+                ### --- logging diversity ---
                 if logfile is not None:
                     frags_only = [e for e in current if not e.is_paired]
                     if len(frags_only) > 1:
                         log_group_stats(logfile, frags_only, "frag")
+                ### -------------------------
                 _mark_fragments(current, contains_pairs, duplicate_indexes)
             current = [nxt]
             first = nxt
             contains_pairs = nxt.is_paired
             contains_frags = not nxt.is_paired
     if len(current) > 1 and contains_frags:
+        ### --- logging diversity ---
         if logfile is not None:
             frags_only = [e for e in current if not e.is_paired]
             if len(frags_only) > 1:
                 log_group_stats(logfile, frags_only, "frag")
+        ### -------------------------
         _mark_fragments(current, contains_pairs, duplicate_indexes)
 
     if logfile is not None:
