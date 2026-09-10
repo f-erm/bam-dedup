@@ -70,13 +70,13 @@ except ImportError:  # pragma: no cover - pure-Python fallback
 # Read diversity constants -- Evaluate diversity in each duplicate group
 # ----------------------------------------------------------------------------
 
-#TODO: Note sure how this handles soft clipping for now.
 
 _CIG_INS, _CIG_DEL, _CIG_REFSKIP = 1, 2, 3
 _EMPTY_SIG = frozenset()
 _EMPTY_SUBQ = {}
 DEFAULT_MIN_BQ = 30 #TODO: this is just some guess, might need different value
 DEFAULT_QUAL_GAP = 10 #TODO: this is just some guess, might need different value
+DEFAULT_MAX_CLUSTER_DIFF = 0 #Set 0 to make any diff justify a new cluster
 
 def _indel_events(read):
     """Indels as (op, ref_pos, length). Walks the cigar tracking reference position."""
@@ -97,7 +97,7 @@ def _indel_events(read):
 
 
 def _all_substitutions(read):
-    """ref_pos -> (observed_base, base_qual) for every mismatch, independent of quality. Requires the MD tag. 
+    """ref_pos -> (observed_base, base_qual) for every mismatch, independent of quality. Requires the MD tag. Does not use missmatches in clipped regions, i.e restricted to aligned region.
     """
     quals = read.query_qualities
     seq = read.query_sequence
@@ -134,7 +134,7 @@ def mismatch_signature(read, min_bq=DEFAULT_MIN_BQ):
     return sig, all_subs
 
 
-#TODO: simply returns lower distance for reads with vastly different quality. Is this Preferred?
+#TODO: simply returns lower distance for reads with vastly different quality. This might not be preferred?
 def _weighted_diff(sig_a, sig_b, subq_a, subq_b, qual_gap):
     """Symmetric difference between two signatures, discounting disagreements that are better explained by unreliable base quality.
 
@@ -163,13 +163,17 @@ def _weighted_diff(sig_a, sig_b, subq_a, subq_b, qual_gap):
     return d
 
 
-def count_distinct_molecules(chunk, max_diff=1, max_group=500, qual_gap=DEFAULT_QUAL_GAP):
-    """Estimated number of distinct source molecules in a duplicate group. Clusters reads in a chunk by their missmatch signature."""
+def cluster_by_molecule(chunk, max_diff=DEFAULT_MAX_CLUSTER_DIFF, max_group=500, qual_gap=DEFAULT_QUAL_GAP):
+    """Partition chunk into groups estimated to share a source molecule.
+
+    Returns a list of sub-lists of chunk's own entries (every entry appears in
+    exactly one group). max_diff defines how much reads can differ, based on _weighted_diff, and still be put in same cluster. Set to 0 to make any difference justify new clusters.
+    """
     n = len(chunk)
-    if n < 2:
-        return n
-    if n > max_group:
-        return None                       # pileup artifact; O(n^2) not worth it
+    if n == 0:
+        return []
+    if n < 2 or n > max_group:
+        return [chunk]
 
     parent = list(range(n))
 
@@ -190,7 +194,27 @@ def count_distinct_molecules(chunk, max_diff=1, max_group=500, qual_gap=DEFAULT_
                 if ra != rb:
                     parent[ra] = rb
 
-    return len({find(i) for i in range(n)})
+    groups = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(chunk[i])
+    return list(groups.values())
+
+
+def count_distinct_molecules(chunk, max_diff=DEFAULT_MAX_CLUSTER_DIFF, max_group=500, qual_gap=DEFAULT_QUAL_GAP):
+    """Estimated number of distinct source molecules in a duplicate group."""
+    if len(chunk) > max_group:
+        return None                       # pileup artifact; O(n^2) not worth it
+    return len(cluster_by_molecule(chunk, max_diff, max_group, qual_gap))
+
+
+def _molecule_groups(chunk, split_by_molecule):
+    """chunk as-is when split_by_molecule is off; its molecule clusters otherwise.
+
+    The single seam _mark_pairs/_mark_fragments iterate over -- keeps the
+    stock-Picard behavior (one candidate group == one keeper) as the default,
+    with per-molecule splitting as an opt-in departure from it.
+    """
+    return cluster_by_molecule(chunk) if split_by_molecule else [chunk]
 
 # -------------------------------------------------------------- #
 
@@ -764,7 +788,8 @@ def _comparable(lhs, rhs, compare_read2):
     return True
 
 
-def generate_duplicate_indexes(frag_list, pair_list, index_optical, optical_dist, rmlog=None):
+def generate_duplicate_indexes(frag_list, pair_list, index_optical, optical_dist,
+                               rmlog=None, split_by_molecule=False):
     duplicate_indexes = set()
     optical_indexes = set()
     optical_cluster_count = 0
@@ -787,7 +812,7 @@ def generate_duplicate_indexes(frag_list, pair_list, index_optical, optical_dist
             ### -------------------------
             optical_cluster_count += _mark_pairs(
                 chunk, duplicate_indexes, optical_indexes,
-                index_optical, optical_dist)
+                index_optical, optical_dist, split_by_molecule)
 
     # ---- fragments ----
     frag_list.sort(key=ReadEnds.sort_key)
@@ -808,7 +833,7 @@ def generate_duplicate_indexes(frag_list, pair_list, index_optical, optical_dist
                     if len(frags_only) > 1:
                         log_group_stats(logfile, frags_only, "frag")
                 ### -------------------------
-                _mark_fragments(current, contains_pairs, duplicate_indexes)
+                _mark_fragments(current, contains_pairs, duplicate_indexes, split_by_molecule)
             current = [nxt]
             first = nxt
             contains_pairs = nxt.is_paired
@@ -856,36 +881,46 @@ def _best(chunk):
 
 
 def _mark_pairs(chunk, duplicate_indexes, optical_indexes,
-                index_optical, optical_dist):
-    best = _best(chunk)
-    n_optical = 0
-    # optical detection over the whole chunk (keeper = best)
-    n_optical = track_optical_duplicates(chunk, best, optical_dist)
-
-    for e in chunk:
-        if e is best:
+                index_optical, optical_dist, split_by_molecule=False):
+    # When split_by_molecule is set, each estimated source molecule gets its
+    # own keeper instead of collapsing the whole chunk to a single survivor.
+    optical_cluster_count = 0
+    for molecule in _molecule_groups(chunk, split_by_molecule):
+        if len(molecule) < 2:
             continue
-        duplicate_indexes.add(e.read1_index)
-        if e.read2_index != e.read1_index:
-            duplicate_indexes.add(e.read2_index)
-        if e.is_optical_duplicate and index_optical:
-            optical_indexes.add(e.read1_index)
+        best = _best(molecule)
+        # optical detection over the molecule (keeper = best)
+        n_optical = track_optical_duplicates(molecule, best, optical_dist)
+        if n_optical > 0:
+            optical_cluster_count += 1
+
+        for e in molecule:
+            if e is best:
+                continue
+            duplicate_indexes.add(e.read1_index)
             if e.read2_index != e.read1_index:
-                optical_indexes.add(e.read2_index)
-    return 1 if n_optical > 0 else 0
+                duplicate_indexes.add(e.read2_index)
+            if e.is_optical_duplicate and index_optical:
+                optical_indexes.add(e.read1_index)
+                if e.read2_index != e.read1_index:
+                    optical_indexes.add(e.read2_index)
+    return optical_cluster_count
 
 
-def _mark_fragments(chunk, contains_pairs, duplicate_indexes):
+def _mark_fragments(chunk, contains_pairs, duplicate_indexes, split_by_molecule=False):
     if contains_pairs:
         # Any unpaired fragment sharing a start with a pair is a duplicate.
         for e in chunk:
             if not e.is_paired:
                 duplicate_indexes.add(e.read1_index)
     else:
-        best = _best(chunk)
-        for e in chunk:
-            if e is not best:
-                duplicate_indexes.add(e.read1_index)
+        for molecule in _molecule_groups(chunk, split_by_molecule):
+            if len(molecule) < 2:
+                continue
+            best = _best(molecule)
+            for e in molecule:
+                if e is not best:
+                    duplicate_indexes.add(e.read1_index)
 
 
 # ----------------------------------------------------------------------------
@@ -922,7 +957,8 @@ def mark_duplicates(input_bam, output_bam,
                     optical_pixel_distance=DEFAULT_OPTICAL_PIXEL_DISTANCE,
                     metrics_file=None,
                     barcode_tag=None,
-                    rmlog=None):
+                    rmlog=None,
+                    split_by_molecule=False):
     """
     barcode_tag: when set, reads/pairs are additionally grouped by the value of
     this tag before duplicate detection, so records that would otherwise look
@@ -934,6 +970,12 @@ def mark_duplicates(input_bam, output_bam,
     UmiUtil.getTopStrandNormalizedUmi and, in testing, silently finds zero
     duplicates when the tag value is constant across a large group of reads,
     e.g. a single-cell barcode with no true per-molecule UMI).
+
+    split_by_molecule: when set, each duplicate-candidate group is further
+    split into estimated source molecules (see count_distinct_molecules) and
+    every molecule keeps its own keeper record, instead of stock Picard's one
+    keeper per group. Off by default -- this is a deliberate departure from
+    Picard, not a port of it.
     """
     with pysam.AlignmentFile(input_bam, "rb") as bam:
         so = bam.header.get("HD", {}).get("SO", "unknown")
@@ -946,7 +988,8 @@ def mark_duplicates(input_bam, output_bam,
 
     index_optical = remove_sequencing_duplicates or (metrics_file is not None)
     dup_idx, opt_idx, opt_clusters = generate_duplicate_indexes(
-        frag_list, pair_list, index_optical, optical_pixel_distance, rmlog)
+        frag_list, pair_list, index_optical, optical_pixel_distance, rmlog,
+        split_by_molecule)
 
     n_dup = write_output(input_bam, output_bam, dup_idx, opt_idx,
                          remove_duplicates, remove_sequencing_duplicates)
@@ -984,6 +1027,11 @@ def main(argv=None):
                         "position but carrying different tag values are never collapsed")
     p.add_argument("--rmlog", default=None,
                help="write per-duplicate-group diversity stats to rmdupslog file")
+    p.add_argument("--split-by-molecule", action="store_true",
+                   help="split each duplicate-candidate group into estimated source "
+                        "molecules (see count_distinct_molecules) and keep one "
+                        "representative per molecule, instead of one per group; a "
+                        "deliberate departure from stock Picard, off by default")
     args = p.parse_args(argv)
 
     mark_duplicates(
@@ -995,6 +1043,7 @@ def main(argv=None):
         metrics_file=args.metrics_file,
         barcode_tag=args.barcode_tag,
         rmlog=args.rmlog,
+        split_by_molecule=args.split_by_molecule,
     )
 
 
