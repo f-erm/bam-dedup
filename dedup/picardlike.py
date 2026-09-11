@@ -218,39 +218,53 @@ def _molecule_groups(chunk, split_by_molecule):
 
 # -------------------------------------------------------------- #
 
-def _event_positions(sig):
-    """Reference positions touched by a signature."""
-    return {e[1] if e[0] in ("I", "D") else e[0] for e in sig}
+def _pos_of(e):
+    """Reference position an event touches (indel tuples carry it at e[1])."""
+    return e[1] if isinstance(e[0], str) else e[0]
 
 
 def group_disagreement_positions(sigs):
-    """Positions where the records in a group don't all agree"""
-    events_at = {}                     
-    records_at = Counter()
+    """(n_sub, n_indel): positions where the records in a group don't all
+    agree, split by event type -- substitutions vs. indels."""
+    sub_events_at, indel_events_at = {}, {}
+    sub_records_at, indel_records_at = Counter(), Counter()
 
     for s1, s2 in sigs:
         merged = s1 | s2
-        for pos in _event_positions(merged):
-            records_at[pos] += 1
-        for e in merged:
-            pos = e[1] if isinstance(e[0], str) else e[0]
-            events_at.setdefault(pos, set()).add(e)
+        subs = {e for e in merged if not isinstance(e[0], str)}
+        indels = {e for e in merged if isinstance(e[0], str)}
+
+        for pos in {_pos_of(e) for e in subs}:
+            sub_records_at[pos] += 1
+        for e in subs:
+            sub_events_at.setdefault(_pos_of(e), set()).add(e)
+
+        for pos in {_pos_of(e) for e in indels}:
+            indel_records_at[pos] += 1
+        for e in indels:
+            indel_events_at.setdefault(_pos_of(e), set()).add(e)
 
     n = len(sigs)
-    return sum(1 for pos, events in events_at.items()
-               if len(events) > 1 or records_at[pos] < n)
+
+    def _count(events_at, records_at):
+        return sum(1 for pos, events in events_at.items()
+                   if len(events) > 1 or records_at[pos] < n)
+
+    return _count(sub_events_at, sub_records_at), _count(indel_events_at, indel_records_at)
 
 
 def log_group_stats(logfile, chunk, kind):
     sigs = [(e.sig1, e.sig2) for e in chunk]
     counts = Counter(sigs)
+    n_sub_disagree, n_indel_disagree = group_disagreement_positions(sigs)
     logfile.write(
         f"{kind}\t"
         f"{len(chunk)}\t"
         f"{len(counts)}\t"
         f"{max(counts.values())}\t"
         f"{count_distinct_molecules(chunk)}\t"
-        f"{group_disagreement_positions(sigs)}\n"
+        f"{n_sub_disagree}\t"
+        f"{n_indel_disagree}\n"
     )
 
 # ----------------------------------------------------------------------------
@@ -797,7 +811,7 @@ def generate_duplicate_indexes(frag_list, pair_list, index_optical, optical_dist
     ### --- logging diversity ---
     if rmlog:
         logfile = open(rmlog, "w")
-        logfile.write(f"kind\tn_groupsize\tn_distinct_exact\tn_distinct_exact_max\tn_distinct_clustered\tn_group_disagreement_positions\n")
+        logfile.write(f"kind\tn_groupsize\tn_distinct_exact\tn_distinct_exact_max\tn_distinct_clustered\tn_sub_disagreement_positions\tn_indel_disagreement_positions\n")
     else:
         logfile = None
     ### -------------------------
