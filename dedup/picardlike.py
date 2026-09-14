@@ -97,7 +97,7 @@ def _indel_events(read):
 
 
 def _all_substitutions(read):
-    """ref_pos -> (observed_base, base_qual) for every mismatch, independent of quality. Requires the MD tag. Does not use missmatches in clipped regions, i.e restricted to aligned region.
+    """ref_pos -> (observed_base, base_qual) for every mismatch, independent of quality. Requires the MD tag. Restricted to aligned region.
     """
     quals = read.query_qualities
     seq = read.query_sequence
@@ -208,12 +208,7 @@ def count_distinct_molecules(chunk, max_diff=DEFAULT_MAX_CLUSTER_DIFF, max_group
 
 
 def _molecule_groups(chunk, split_by_molecule):
-    """chunk as-is when split_by_molecule is off; its molecule clusters otherwise.
-
-    The single seam _mark_pairs/_mark_fragments iterate over -- keeps the
-    stock-Picard behavior (one candidate group == one keeper) as the default,
-    with per-molecule splitting as an opt-in departure from it.
-    """
+    """chunk as-is when split_by_molecule is off; its molecule clusters otherwise."""
     return cluster_by_molecule(chunk) if split_by_molecule else [chunk]
 
 # -------------------------------------------------------------- #
@@ -254,6 +249,7 @@ def group_disagreement_positions(sigs):
 
 
 def log_group_stats(logfile, chunk, kind):
+    """write chunks duplicate group sizes and statistics to log file"""
     sigs = [(e.sig1, e.sig2) for e in chunk]
     counts = Counter(sigs)
     n_sub_disagree, n_indel_disagree = group_disagreement_positions(sigs)
@@ -305,6 +301,7 @@ class ReadEnds:
         "barcode_value",
         "sig1", "sig2",
         "sub_quals1", "sub_quals2",
+        "file_offset1", "file_offset2",
     )
 
     def __init__(self):
@@ -329,6 +326,10 @@ class ReadEnds:
         self.sig2 = _EMPTY_SIG
         self.sub_quals1 = _EMPTY_SUBQ
         self.sub_quals2 = _EMPTY_SUBQ
+        # BGZF virtual file offsets (AlignmentFile.tell()), one per mate --
+        # Allows for quick re-read of original record without keeping read in memory
+        self.file_offset1 = None
+        self.file_offset2 = None
 
     @property
     def is_paired(self):
@@ -360,6 +361,8 @@ class ReadEnds:
         c.sig2 = self.sig2
         c.sub_quals1 = self.sub_quals1
         c.sub_quals2 = self.sub_quals2
+        c.file_offset1 = self.file_offset1
+        c.file_offset2 = self.file_offset2
         return c
 
     # Sort key == picard ReadEndsMDComparator.compare, extended with an
@@ -668,12 +671,13 @@ def build_read_ends(bam, read_name_regex_enabled, optical_dist, barcode_tag=None
             library_ids[lib] = lid
         return lid, lib
 
-    def make_end(read, index):
+    def make_end(read, index, offset):
         e = ReadEnds()
         e.read1_ref = read.reference_id
         e.read1_coord = unclipped_5prime_coord(read)
         e.orientation = R if read.is_reverse else F
         e.read1_index = index
+        e.file_offset1 = offset
         e.score = compute_duplicate_score(read)
         e.sig1, e.sub_quals1 = mismatch_signature(read, DEFAULT_MIN_BQ)
         if read.is_paired and not read.mate_is_unmapped:
@@ -701,7 +705,17 @@ def build_read_ends(bam, read_name_regex_enabled, optical_dist, barcode_tag=None
     pending = {}   # (mate_ref, rg+readname) -> ReadEnds waiting for its mate
 
     index = 0
-    for read in bam.fetch(until_eof=True):
+    # Manual iteration (instead of `for read in bam.fetch(...)`) so we can
+    # capture each record's virtual file offset via bam.tell() BEFORE it's
+    # consumed -- that's the offset that, seeked to later, re-reads this same
+    # record (tell() after next() would point past it, at the next record).
+    bam_iter = bam.fetch(until_eof=True)
+    while True:
+        offset = bam.tell()
+        try:
+            read = next(bam_iter)
+        except StopIteration:
+            break
         if read.is_unmapped:
             # coordinate-sorted: trailing unmapped (ref==-1) reads carry no info
             if read.reference_id == -1:
@@ -714,7 +728,7 @@ def build_read_ends(bam, read_name_regex_enabled, optical_dist, barcode_tag=None
             index += 1
             continue
 
-        frag = make_end(read, index)
+        frag = make_end(read, index, offset)
         frag_list.append(frag)
 
         if read.is_paired and not read.mate_is_unmapped:
@@ -762,6 +776,7 @@ def _combine_mate(paired, frag, read, optical):
         paired.read2_index = frag.read1_index
         paired.sig2 = frag.sig1
         paired.sub_quals2 = frag.sub_quals1
+        paired.file_offset2 = frag.file_offset1
         paired.orientation = orientation_byte(paired.orientation == R,
                                               read.is_reverse)
         # Undefined RF at identical position -> force FR (see Picard comment).
@@ -775,11 +790,13 @@ def _combine_mate(paired, frag, read, optical):
         paired.read2_index = paired.read1_index
         paired.sig2 = paired.sig1
         paired.sub_quals2 = paired.sub_quals1
+        paired.file_offset2 = paired.file_offset1
         paired.read1_ref = mates_ref
         paired.read1_coord = mates_coord
         paired.read1_index = frag.read1_index
         paired.sig1 = frag.sig1
         paired.sub_quals1 = frag.sub_quals1
+        paired.file_offset1 = frag.file_offset1
         paired.orientation = orientation_byte(read.is_reverse,
                                               paired.orientation == R)
 
@@ -803,7 +820,8 @@ def _comparable(lhs, rhs, compare_read2):
 
 
 def generate_duplicate_indexes(frag_list, pair_list, index_optical, optical_dist,
-                               rmlog=None, split_by_molecule=False):
+                               rmlog=None, split_by_molecule=False, bam2=None,
+                               use_position_scoring=False):
     duplicate_indexes = set()
     optical_indexes = set()
     optical_cluster_count = 0
@@ -826,7 +844,8 @@ def generate_duplicate_indexes(frag_list, pair_list, index_optical, optical_dist
             ### -------------------------
             optical_cluster_count += _mark_pairs(
                 chunk, duplicate_indexes, optical_indexes,
-                index_optical, optical_dist, split_by_molecule)
+                index_optical, optical_dist, split_by_molecule, bam2,
+                use_position_scoring)
 
     # ---- fragments ----
     frag_list.sort(key=ReadEnds.sort_key)
@@ -847,7 +866,8 @@ def generate_duplicate_indexes(frag_list, pair_list, index_optical, optical_dist
                     if len(frags_only) > 1:
                         log_group_stats(logfile, frags_only, "frag")
                 ### -------------------------
-                _mark_fragments(current, contains_pairs, duplicate_indexes, split_by_molecule)
+                _mark_fragments(current, contains_pairs, duplicate_indexes, split_by_molecule, bam2,
+                                use_position_scoring)
             current = [nxt]
             first = nxt
             contains_pairs = nxt.is_paired
@@ -859,7 +879,8 @@ def generate_duplicate_indexes(frag_list, pair_list, index_optical, optical_dist
             if len(frags_only) > 1:
                 log_group_stats(logfile, frags_only, "frag")
         ### -------------------------
-        _mark_fragments(current, contains_pairs, duplicate_indexes)
+        _mark_fragments(current, contains_pairs, duplicate_indexes, split_by_molecule, bam2,
+                        use_position_scoring)
 
     if logfile is not None:
         logfile.close()
@@ -893,16 +914,86 @@ def _best(chunk):
             best = e
     return best
 
+def _quals_at_offset(bam2, offset, positions):
+    """qualities at positions, for read determined by its offset in the bam file
+    """
+    if offset is None or not positions:
+        return {}
+    bam2.seek(offset)
+    read = next(bam2)
+    quals = read.query_qualities
+    if quals is None:
+        return {}
+    out = {}
+    for qpos, refpos in read.get_aligned_pairs(matches_only=True):
+        if refpos in positions:
+            out[refpos] = quals[qpos]
+    return out
+
+
+def _group_has_indels(chunk):
+    return any(isinstance(e[0], str) for m in chunk for e in (m.sig1 | m.sig2))
+
+
+def _group_substitution_positions(chunk):
+    """(positions1, positions2): substitution ref-positions occurring
+    anywhere in the group, split by mate side -- mate1's positions are only
+    meaningful against mate1's own alignment, and likewise for mate2."""
+    positions1 = {_pos_of(e) for m in chunk for e in m.sig1 if not isinstance(e[0], str)}
+    positions2 = {_pos_of(e) for m in chunk for e in m.sig2 if not isinstance(e[0], str)}
+    return positions1, positions2
+
+
+def _score_at_positions(e, positions1, positions2, bam2):
+    """Sum of e's actual base qualities at positions1 (read1 side) and
+    positions2 (read2/mate side) -- looked up from the BAM via e's stored
+    file offsets"""
+    total = 0
+    if positions1:
+        total += sum(_quals_at_offset(bam2, e.file_offset1, positions1).values())
+    if positions2:
+        total += sum(_quals_at_offset(bam2, e.file_offset2, positions2).values())
+    return total
+
+
+def _best_at_positions(chunk, positions1, positions2, bam2):
+    """Like _best, but scores each read by its actual base quality at
+    positions1/positions2 (the group's substitution positions) instead of
+    the whole read."""
+    best = None
+    max_score = 0
+    for e in chunk:
+        score = _score_at_positions(e, positions1, positions2, bam2)
+        if best is None or score > max_score:
+            max_score = score
+            best = e
+    return best
+
+
+def _choose_best(chunk, bam2, use_position_scoring=False):
+    """Group representative selection. If use_position_scoring then read representative is based on only qualites at positions where substitutions happen in this group, instead of overall reads score. 
+    falls back to _best whenever the group has any indels (no comparable quality signal to weigh an indel disagreement) or has no substitutions at all
+    """
+    if not use_position_scoring:
+        return _best(chunk)
+    if _group_has_indels(chunk):
+        return _best(chunk)
+    positions1, positions2 = _group_substitution_positions(chunk)
+    if not positions1 and not positions2:
+        return _best(chunk)
+    return _best_at_positions(chunk, positions1, positions2, bam2)
+
 
 def _mark_pairs(chunk, duplicate_indexes, optical_indexes,
-                index_optical, optical_dist, split_by_molecule=False):
+                index_optical, optical_dist, split_by_molecule=False, bam2=None,
+                use_position_scoring=False):
     # When split_by_molecule is set, each estimated source molecule gets its
     # own keeper instead of collapsing the whole chunk to a single survivor.
     optical_cluster_count = 0
     for molecule in _molecule_groups(chunk, split_by_molecule):
         if len(molecule) < 2:
             continue
-        best = _best(molecule)
+        best = _choose_best(molecule, bam2, use_position_scoring)
         # optical detection over the molecule (keeper = best)
         n_optical = track_optical_duplicates(molecule, best, optical_dist)
         if n_optical > 0:
@@ -921,7 +1012,8 @@ def _mark_pairs(chunk, duplicate_indexes, optical_indexes,
     return optical_cluster_count
 
 
-def _mark_fragments(chunk, contains_pairs, duplicate_indexes, split_by_molecule=False):
+def _mark_fragments(chunk, contains_pairs, duplicate_indexes, split_by_molecule=False, bam2=None,
+                    use_position_scoring=False):
     if contains_pairs:
         # Any unpaired fragment sharing a start with a pair is a duplicate.
         for e in chunk:
@@ -931,7 +1023,7 @@ def _mark_fragments(chunk, contains_pairs, duplicate_indexes, split_by_molecule=
         for molecule in _molecule_groups(chunk, split_by_molecule):
             if len(molecule) < 2:
                 continue
-            best = _best(molecule)
+            best = _choose_best(molecule, bam2, use_position_scoring)
             for e in molecule:
                 if e is not best:
                     duplicate_indexes.add(e.read1_index)
@@ -972,7 +1064,8 @@ def mark_duplicates(input_bam, output_bam,
                     metrics_file=None,
                     barcode_tag=None,
                     rmlog=None,
-                    split_by_molecule=False):
+                    split_by_molecule=False,
+                    use_position_scoring=False):
     """
     barcode_tag: when set, reads/pairs are additionally grouped by the value of
     this tag before duplicate detection, so records that would otherwise look
@@ -990,6 +1083,14 @@ def mark_duplicates(input_bam, output_bam,
     every molecule keeps its own keeper record, instead of stock Picard's one
     keeper per group. Off by default -- this is a deliberate departure from
     Picard, not a port of it.
+
+    use_position_scoring: when set, the representative chosen within each
+    group/molecule (see _choose_best) is scored by actual base quality at
+    just the group's substitution positions, rather than the stock whole-read
+    quality sum -- but only when the group's disagreement is purely
+    substitutions; groups with any indels, or with no substitutions at all,
+    still use the stock scoring regardless of this flag. Off by default --
+    another deliberate departure from Picard, not a port of it.
     """
     with pysam.AlignmentFile(input_bam, "rb") as bam:
         so = bam.header.get("HD", {}).get("SO", "unknown")
@@ -1001,9 +1102,14 @@ def mark_duplicates(input_bam, output_bam,
             bam, read_name_regex_enabled, optical_pixel_distance, barcode_tag)
 
     index_optical = remove_sequencing_duplicates or (metrics_file is not None)
-    dup_idx, opt_idx, opt_clusters = generate_duplicate_indexes(
-        frag_list, pair_list, index_optical, optical_pixel_distance, rmlog,
-        split_by_molecule)
+    # Second, independent handle: phase 2 seeks back into the file (via each
+    # ReadEnds' stored file_offset) to look up actual base qualities for
+    # _choose_best/_best_at_positions, well after the first handle above --
+    # used only for the streaming pass -- has closed.
+    with pysam.AlignmentFile(input_bam, "rb") as bam2:
+        dup_idx, opt_idx, opt_clusters = generate_duplicate_indexes(
+            frag_list, pair_list, index_optical, optical_pixel_distance, rmlog,
+            split_by_molecule, bam2, use_position_scoring)
 
     n_dup = write_output(input_bam, output_bam, dup_idx, opt_idx,
                          remove_duplicates, remove_sequencing_duplicates)
@@ -1046,6 +1152,12 @@ def main(argv=None):
                         "molecules (see count_distinct_molecules) and keep one "
                         "representative per molecule, instead of one per group; a "
                         "deliberate departure from stock Picard, off by default")
+    p.add_argument("--use-position-scoring", action="store_true",
+                   help="score the representative within each group/molecule by actual "
+                        "base quality at just its substitution positions (see "
+                        "_choose_best), instead of the stock whole-read quality sum -- "
+                        "only when the group's disagreement is purely substitutions; "
+                        "a deliberate departure from stock Picard, off by default")
     args = p.parse_args(argv)
 
     mark_duplicates(
@@ -1058,6 +1170,7 @@ def main(argv=None):
         barcode_tag=args.barcode_tag,
         rmlog=args.rmlog,
         split_by_molecule=args.split_by_molecule,
+        use_position_scoring=args.use_position_scoring,
     )
 
 
