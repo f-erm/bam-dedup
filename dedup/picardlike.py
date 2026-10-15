@@ -74,8 +74,7 @@ except ImportError:  # pragma: no cover - pure-Python fallback
 _CIG_INS, _CIG_DEL, _CIG_REFSKIP = 1, 2, 3
 _EMPTY_SIG = frozenset()
 _EMPTY_SUBQ = {}
-DEFAULT_MIN_BQ = 30 #TODO: this is just some guess, might need different value
-DEFAULT_QUAL_GAP = 10 #TODO: this is just some guess, might need different value
+DEFAULT_MIN_BQ = 30 #TODO: This is just some guess, might need different value
 DEFAULT_MAX_CLUSTER_DIFF = 0 #Set 0 to make any diff justify a new cluster
 
 def _indel_events(read):
@@ -134,14 +133,12 @@ def mismatch_signature(read, min_bq=DEFAULT_MIN_BQ):
     return sig, all_subs
 
 
-#TODO: simply returns lower distance for reads with vastly different quality. This might not be preferred?
-def _weighted_diff(sig_a, sig_b, subq_a, subq_b, qual_gap):
+def _weighted_diff(sig_a, sig_b, subq_a, subq_b):
     """Symmetric difference between two signatures, discounting disagreements that are better explained by unreliable base quality.
 
-    A differing event at a given ref_pos is NOT counted when:
-      - both reads called the same substitution there (one just fell under
-        min_bq and so is missing from sig, not from subq), or
-      - both reads called a substitution but quality gap is >= qual_gap . lower-quality call is discounted
+    A differing event at a given ref_pos is NOT counted when both reads
+    called the same substitution there (one just fell under min_bq and so
+    is missing from sig, not from subq).
     """
     d = 0
     scored_positions = set()
@@ -155,15 +152,15 @@ def _weighted_diff(sig_a, sig_b, subq_a, subq_b, qual_gap):
         scored_positions.add(pos)
         in_a, in_b = subq_a.get(pos), subq_b.get(pos)
         if in_a is not None and in_b is not None:
-            base_a, qual_a = in_a
-            base_b, qual_b = in_b
-            if base_a == base_b or abs(qual_a - qual_b) >= qual_gap:
+            base_a, _ = in_a
+            base_b, _ = in_b
+            if base_a == base_b:
                 continue
         d += 1
     return d
 
 
-def cluster_by_molecule(chunk, max_diff=DEFAULT_MAX_CLUSTER_DIFF, max_group=500, qual_gap=DEFAULT_QUAL_GAP):
+def cluster_by_molecule(chunk, max_diff=DEFAULT_MAX_CLUSTER_DIFF, max_group=500):
     """Partition chunk into groups estimated to share a source molecule.
 
     Returns a list of sub-lists of chunk's own entries (every entry appears in
@@ -187,8 +184,8 @@ def cluster_by_molecule(chunk, max_diff=DEFAULT_MAX_CLUSTER_DIFF, max_group=500,
     subqs = [(e.sub_quals1, e.sub_quals2) for e in chunk]
     for i in range(n):
         for j in range(i + 1, n):
-            d = (_weighted_diff(sigs[i][0], sigs[j][0], subqs[i][0], subqs[j][0], qual_gap)
-                 + _weighted_diff(sigs[i][1], sigs[j][1], subqs[i][1], subqs[j][1], qual_gap))
+            d = (_weighted_diff(sigs[i][0], sigs[j][0], subqs[i][0], subqs[j][0])
+                 + _weighted_diff(sigs[i][1], sigs[j][1], subqs[i][1], subqs[j][1]))
             if d <= max_diff:
                 ra, rb = find(i), find(j)
                 if ra != rb:
@@ -200,11 +197,11 @@ def cluster_by_molecule(chunk, max_diff=DEFAULT_MAX_CLUSTER_DIFF, max_group=500,
     return list(groups.values())
 
 
-def count_distinct_molecules(chunk, max_diff=DEFAULT_MAX_CLUSTER_DIFF, max_group=500, qual_gap=DEFAULT_QUAL_GAP):
+def count_distinct_molecules(chunk, max_diff=DEFAULT_MAX_CLUSTER_DIFF, max_group=500):
     """Estimated number of distinct source molecules in a duplicate group."""
     if len(chunk) > max_group:
         return None                       # pileup artifact; O(n^2) not worth it
-    return len(cluster_by_molecule(chunk, max_diff, max_group, qual_gap))
+    return len(cluster_by_molecule(chunk, max_diff, max_group))
 
 
 def _molecule_groups(chunk, split_by_molecule):
