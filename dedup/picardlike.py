@@ -245,13 +245,29 @@ def group_disagreement_positions(sigs):
     return _count(sub_events_at, sub_records_at), _count(indel_events_at, indel_records_at)
 
 
-def log_group_stats(logfile, chunk, kind):
-    """write chunks duplicate group sizes and statistics to log file"""
+def group_key_str(entry, bam):
+    """Compact rendering of a group's key. Not guaranteed unique, just enough to spot/grep a group in the log.
+    """
+    orientation_names = {0: "F", 1: "R", 2: "FF", 3: "FR", 4: "RR", 5: "RF"}
+    orient = orientation_names.get(entry.orientation, str(entry.orientation))
+    ref1 = bam.get_reference_name(entry.read1_ref) if bam is not None and entry.read1_ref != -1 else str(entry.read1_ref)
+    key = f"lib{entry.library_id}:{ref1}:{entry.read1_coord}:{orient}"
+    if entry.read2_ref != -1:
+        ref2 = bam.get_reference_name(entry.read2_ref) if bam is not None else str(entry.read2_ref)
+        key += f"/{ref2}:{entry.read2_coord}"
+    if entry.barcode_value:
+        key += f":bc={entry.barcode_value[:8]}"
+    return key
+
+
+def log_group_stats(logfile, chunk, kind, bam=None):
+    """write chunks duplicate group key, sizes and statistics to log file"""
     sigs = [(e.sig1, e.sig2) for e in chunk]
     counts = Counter(sigs)
     n_sub_disagree, n_indel_disagree = group_disagreement_positions(sigs)
     logfile.write(
         f"{kind}\t"
+        f"{group_key_str(chunk[0], bam)}\t"
         f"{len(chunk)}\t"
         f"{len(counts)}\t"
         f"{max(counts.values())}\t"
@@ -826,7 +842,7 @@ def generate_duplicate_indexes(frag_list, pair_list, index_optical, optical_dist
     ### --- logging diversity ---
     if rmlog:
         logfile = open(rmlog, "w")
-        logfile.write(f"kind\tn_groupsize\tn_distinct_exact\tn_distinct_exact_max\tn_distinct_clustered\tn_sub_disagreement_positions\tn_indel_disagreement_positions\n")
+        logfile.write(f"kind\tgroup_key\tn_groupsize\tn_distinct_exact\tn_distinct_exact_max\tn_distinct_clustered\tn_sub_disagreement_positions\tn_indel_disagreement_positions\n")
     else:
         logfile = None
     ### -------------------------
