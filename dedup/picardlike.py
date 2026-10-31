@@ -133,6 +133,34 @@ def mismatch_signature(read, min_bq=DEFAULT_MIN_BQ):
     return sig, all_subs
 
 
+def _mismatch_event_key(event):
+    """Sort key ordering substitution/indel events into one consistent order."""
+    pos = event[0]
+    if isinstance(pos, int):
+        _, base = event
+        return (0, pos, base, 0)
+    op, pos, length = event
+    return (1, pos, op, length)
+
+
+def mismatch_signature_str(sig):
+    """Canonical string form of a mismatch_signature frozenset. 
+    Reads with identical mismatches always produce identical strings, independent of order
+    """
+    if not sig:
+        return ""
+    parts = []
+    for event in sorted(sig, key=_mismatch_event_key):
+        pos = event[0]
+        if isinstance(pos, int):
+            _, base = event
+            parts.append(f"{pos}{base}")
+        else:
+            op, pos, length = event
+            parts.append(f"{op}{pos}:{length}")
+    return ";".join(parts)
+
+
 def _weighted_diff(sig_a, sig_b, subq_a, subq_b):
     """Symmetric difference between two signatures, discounting disagreements that are better explained by unreliable base quality.
 
@@ -265,6 +293,10 @@ def log_group_stats(logfile, chunk, kind, bam=None):
     sigs = [(e.sig1, e.sig2) for e in chunk]
     counts = Counter(sigs)
     n_sub_disagree, n_indel_disagree = group_disagreement_positions(sigs)
+    sig_strs = sorted(
+        f"{mismatch_signature_str(s1)}/{mismatch_signature_str(s2)}"
+        for s1, s2 in counts
+    )
     logfile.write(
         f"{kind}\t"
         f"{group_key_str(chunk[0], bam)}\t"
@@ -273,7 +305,8 @@ def log_group_stats(logfile, chunk, kind, bam=None):
         f"{max(counts.values())}\t"
         f"{count_distinct_molecules(chunk)}\t"
         f"{n_sub_disagree}\t"
-        f"{n_indel_disagree}\n"
+        f"{n_indel_disagree}\t"
+        f"{','.join(sig_strs)}\n"
     )
 
 # ----------------------------------------------------------------------------
@@ -842,7 +875,7 @@ def generate_duplicate_indexes(frag_list, pair_list, index_optical, optical_dist
     ### --- logging diversity ---
     if rmlog:
         logfile = open(rmlog, "w")
-        logfile.write(f"kind\tgroup_key\tn_groupsize\tn_distinct_exact\tn_distinct_exact_max\tn_distinct_clustered\tn_sub_disagreement_positions\tn_indel_disagreement_positions\n")
+        logfile.write(f"kind\tgroup_key\tn_groupsize\tn_distinct_exact\tn_distinct_exact_max\tn_distinct_clustered\tn_sub_disagreement_positions\tn_indel_disagreement_positions\tsignatures\n")
     else:
         logfile = None
     ### -------------------------
