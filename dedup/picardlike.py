@@ -384,7 +384,6 @@ class ReadEnds:
     def sort_key(self):
         return (
             self.library_id,
-            self.barcode_value,
             self.read1_ref,
             self.read1_coord,
             self.orientation,
@@ -395,6 +394,7 @@ class ReadEnds:
             self.y,
             self.read1_index,
             self.read2_index,
+            self.barcode_value, # TODO used to be right under library_id. Change here is only for debugging
         )
 
 
