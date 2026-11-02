@@ -288,6 +288,10 @@ def group_key_str(entry, bam):
     return key
 
 
+# just for debugging, move this eventually. Determines at which groups size we
+# start logging. Should usually be set to 1
+MIN_LOG_SIZE = 0
+
 def log_group_stats(logfile, chunk, kind, bam=None):
     """write chunks duplicate group key, sizes and statistics to log file"""
     sigs = [(e.sig1, e.sig2) for e in chunk]
@@ -883,7 +887,7 @@ def generate_duplicate_indexes(frag_list, pair_list, index_optical, optical_dist
     # ---- pairs ----
     pair_list.sort(key=ReadEnds.sort_key)
     for chunk in _chunks(pair_list, compare_read2=True):
-        if len(chunk) > 1:
+        if len(chunk) > MIN_LOG_SIZE:
             ### --- logging diversity ---
             if logfile is not None:
                 log_group_stats(logfile, chunk, "pair")
@@ -905,11 +909,11 @@ def generate_duplicate_indexes(frag_list, pair_list, index_optical, optical_dist
             contains_pairs = contains_pairs or nxt.is_paired
             contains_frags = contains_frags or (not nxt.is_paired)
         else:
-            if len(current) > 1 and contains_frags:
+            if len(current) > MIN_LOG_SIZE and contains_frags:
                 ### --- logging diversity ---
                 if logfile is not None:
                     frags_only = [e for e in current if not e.is_paired]
-                    if len(frags_only) > 1:
+                    if len(frags_only) > MIN_LOG_SIZE:
                         log_group_stats(logfile, frags_only, "frag")
                 ### -------------------------
                 _mark_fragments(current, contains_pairs, duplicate_indexes, split_by_molecule, bam2,
@@ -918,11 +922,11 @@ def generate_duplicate_indexes(frag_list, pair_list, index_optical, optical_dist
             first = nxt
             contains_pairs = nxt.is_paired
             contains_frags = not nxt.is_paired
-    if len(current) > 1 and contains_frags:
+    if len(current) > MIN_LOG_SIZE and contains_frags:
         ### --- logging diversity ---
         if logfile is not None:
             frags_only = [e for e in current if not e.is_paired]
-            if len(frags_only) > 1:
+            if len(frags_only) > MIN_LOG_SIZE:
                 log_group_stats(logfile, frags_only, "frag")
         ### -------------------------
         _mark_fragments(current, contains_pairs, duplicate_indexes, split_by_molecule, bam2,
