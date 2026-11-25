@@ -293,6 +293,7 @@ def log_group_stats(logfile, chunk, kind, bam=None):
     sigs = [(e.sig1, e.sig2) for e in chunk]
     counts = Counter(sigs)
     n_sub_disagree, n_indel_disagree = group_disagreement_positions(sigs)
+    # log reads in a chunk by their missmatch signature. / Refers to a readpair matching the ref. If different signatures exist in a chunk they get seperated by ",".
     sig_strs = sorted(
         f"{mismatch_signature_str(s1)}/{mismatch_signature_str(s2)}"
         for s1, s2 in counts
@@ -883,11 +884,11 @@ def generate_duplicate_indexes(frag_list, pair_list, index_optical, optical_dist
     # ---- pairs ----
     pair_list.sort(key=ReadEnds.sort_key)
     for chunk in _chunks(pair_list, compare_read2=True):
+        ### --- logging diversity (incl. size-1 groups) ---
+        if logfile is not None:
+            log_group_stats(logfile, chunk, "pair")
+        ### -------------------------
         if len(chunk) > 1:
-            ### --- logging diversity ---
-            if logfile is not None:
-                log_group_stats(logfile, chunk, "pair")
-            ### -------------------------
             optical_cluster_count += _mark_pairs(
                 chunk, duplicate_indexes, optical_indexes,
                 index_optical, optical_dist, split_by_molecule, bam2,
@@ -905,26 +906,26 @@ def generate_duplicate_indexes(frag_list, pair_list, index_optical, optical_dist
             contains_pairs = contains_pairs or nxt.is_paired
             contains_frags = contains_frags or (not nxt.is_paired)
         else:
+            ### --- logging diversity (incl. size-1 groups) ---
+            if logfile is not None and contains_frags:
+                frags_only = [e for e in current if not e.is_paired]
+                if frags_only:
+                    log_group_stats(logfile, frags_only, "frag")
+            ### -------------------------
             if len(current) > 1 and contains_frags:
-                ### --- logging diversity ---
-                if logfile is not None:
-                    frags_only = [e for e in current if not e.is_paired]
-                    if len(frags_only) > 1:
-                        log_group_stats(logfile, frags_only, "frag")
-                ### -------------------------
                 _mark_fragments(current, contains_pairs, duplicate_indexes, split_by_molecule, bam2,
                                 use_position_scoring)
             current = [nxt]
             first = nxt
             contains_pairs = nxt.is_paired
             contains_frags = not nxt.is_paired
+    ### --- logging diversity (incl. size-1 groups) ---
+    if logfile is not None and contains_frags:
+        frags_only = [e for e in current if not e.is_paired]
+        if frags_only:
+            log_group_stats(logfile, frags_only, "frag")
+    ### -------------------------
     if len(current) > 1 and contains_frags:
-        ### --- logging diversity ---
-        if logfile is not None:
-            frags_only = [e for e in current if not e.is_paired]
-            if len(frags_only) > 1:
-                log_group_stats(logfile, frags_only, "frag")
-        ### -------------------------
         _mark_fragments(current, contains_pairs, duplicate_indexes, split_by_molecule, bam2,
                         use_position_scoring)
 
