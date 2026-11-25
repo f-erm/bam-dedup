@@ -288,6 +288,10 @@ def group_key_str(entry, bam):
     return key
 
 
+# just for debugging, move this eventually. Determines at which groups size we
+# start logging. Should usually be set to 1
+MIN_LOG_SIZE = 0
+
 def log_group_stats(logfile, chunk, kind, bam=None):
     """write chunks duplicate group key, sizes and statistics to log file"""
     sigs = [(e.sig1, e.sig2) for e in chunk]
@@ -418,7 +422,6 @@ class ReadEnds:
     def sort_key(self):
         return (
             self.library_id,
-            self.barcode_value,
             self.read1_ref,
             self.read1_coord,
             self.orientation,
@@ -429,6 +432,7 @@ class ReadEnds:
             self.y,
             self.read1_index,
             self.read2_index,
+            self.barcode_value, # TODO used to be right under library_id. Change here is only for debugging
         )
 
 
@@ -884,8 +888,8 @@ def generate_duplicate_indexes(frag_list, pair_list, index_optical, optical_dist
     # ---- pairs ----
     pair_list.sort(key=ReadEnds.sort_key)
     for chunk in _chunks(pair_list, compare_read2=True):
-        ### --- logging diversity (incl. size-1 groups) ---
-        if logfile is not None:
+        ### --- logging diversity ---
+        if logfile is not None and len(chunk) > MIN_LOG_SIZE:
             log_group_stats(logfile, chunk, "pair")
         ### -------------------------
         if len(chunk) > 1:
@@ -906,10 +910,10 @@ def generate_duplicate_indexes(frag_list, pair_list, index_optical, optical_dist
             contains_pairs = contains_pairs or nxt.is_paired
             contains_frags = contains_frags or (not nxt.is_paired)
         else:
-            ### --- logging diversity (incl. size-1 groups) ---
+            ### --- logging diversity ---
             if logfile is not None and contains_frags:
                 frags_only = [e for e in current if not e.is_paired]
-                if frags_only:
+                if len(frags_only) > MIN_LOG_SIZE:
                     log_group_stats(logfile, frags_only, "frag")
             ### -------------------------
             if len(current) > 1 and contains_frags:
@@ -919,10 +923,10 @@ def generate_duplicate_indexes(frag_list, pair_list, index_optical, optical_dist
             first = nxt
             contains_pairs = nxt.is_paired
             contains_frags = not nxt.is_paired
-    ### --- logging diversity (incl. size-1 groups) ---
+    ### --- logging diversity ---
     if logfile is not None and contains_frags:
         frags_only = [e for e in current if not e.is_paired]
-        if frags_only:
+        if len(frags_only) > MIN_LOG_SIZE:
             log_group_stats(logfile, frags_only, "frag")
     ### -------------------------
     if len(current) > 1 and contains_frags:
